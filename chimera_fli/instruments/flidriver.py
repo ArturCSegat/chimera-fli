@@ -127,8 +127,8 @@ class FliDriver:
         devices = self._sdk.list_devices(self._DEFAULT_DOMAIN)
         if not devices:
             raise RuntimeError(
-                "No FLI filter wheel found on USB. "
-                "Set 'device' in chimera.config to specify the path explicitly."
+                """No FLI filter wheel found on USB.\n
+                Verify its plugged in and the fliusb driver is loaded"""
             )
         filename, model = devices[0]
         self.log.info("FLI auto-discovered: %r (%s)", filename, model)
