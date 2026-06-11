@@ -6,10 +6,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from flisdk import FliDeviceType, FliDomain, FliError, FliSdk, FLI_INVALID_DEVICE
-
-_EPIPE = -32  # errno 32: USB pipe broken — device disconnected mid-transfer
 from flisdk_mock import FliSdkMock
 
+_EPIPE = -32  # errno 32: USB pipe broken — device disconnected mid-transfer
 
 @dataclass
 class FliWheelState:
@@ -166,7 +165,9 @@ class FliDriver:
     def _wait_for_move(self) -> None:
         deadline = time.monotonic() + self._move_timeout_s
         while time.monotonic() < deadline:
-            if self._sdk.get_steps_remaining(self.state.handle) == 0:
+            if self._try_with_reconnect(
+                lambda: self._sdk.get_steps_remaining(self.state.handle)
+            ) == 0:
                 return
             time.sleep(self._POLL_INTERVAL_S)
         raise RuntimeError(
