@@ -5,7 +5,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from flisdk import FliDeviceType, FliDomain, FliSdk, FLI_INVALID_DEVICE
+from flisdk import FliDeviceType, FliDomain, FliError, FliSdk, FLI_INVALID_DEVICE
+
+_EPIPE = -32  # errno 32: USB pipe broken — device disconnected mid-transfer
 from flisdk_mock import FliSdkMock
 
 
@@ -18,10 +20,11 @@ class FliWheelState:
     hw_revision: int = 0
     filter_count: int = 0
     current_position: int = 0
+    reconnect_attempts: int = 0
 
 
 class FliDriver:
-    """Manages device lifecycle and move polling"""
+    """Manages device lifecycle, move polling and reconnect logic"""
 
     _POLL_INTERVAL_S: float = 0.05
     _DEFAULT_DOMAIN: int = int(FliDomain.USB) | int(FliDeviceType.FILTERWHEEL)
@@ -73,6 +76,44 @@ class FliDriver:
             self.state.filter_count,
         )
 
+    _MAX_RECONNECTS = 3
+    _RECONNECT_DELAY_S = (1.0, 5.0, 10.0)
+
+    def _reconnect(self) -> None:
+        """Close the stale handle and reopen"""
+        if self.state.reconnect_attempts >= self._MAX_RECONNECTS:
+            raise RuntimeError(
+                f"FLI device failed to reconnect after {self._MAX_RECONNECTS} attempts"
+            )
+        delay = self._RECONNECT_DELAY_S[self.state.reconnect_attempts]
+        self.state.reconnect_attempts += 1
+        self.log.warning(
+            "FLI USB disconnected (EPIPE) — reconnect attempt %d/%d in %.0f s…",
+            self.state.reconnect_attempts,
+            self._MAX_RECONNECTS,
+            delay,
+        )
+        try:
+            self._sdk.close(self.state.handle)
+        except Exception:
+            pass
+        finally:
+            self.state.handle = FLI_INVALID_DEVICE
+        time.sleep(delay)
+        self.state.handle = self._sdk.open(self.state.device_filename, self._DEFAULT_DOMAIN)
+        self.state.reconnect_attempts = 0
+        self.log.info("FLI device reconnected")
+
+    def _try_with_reconnect(self, fn):
+        """Call fn(); on EPIPE reconnect and retry up to _MAX_RECONNECTS times."""
+        while True:
+            try:
+                return fn()
+            except FliError as e:
+                if e.code != _EPIPE:
+                    raise
+                self._reconnect()
+
     def close(self) -> None:
         if self.state.handle == FLI_INVALID_DEVICE:
             return
@@ -85,7 +126,9 @@ class FliDriver:
         """Return current wheel position (0-indexed)."""
         if self.state.handle == FLI_INVALID_DEVICE:
             raise RuntimeError("Filter wheel not open")
-        self.state.current_position = self._sdk.get_filter_pos(self.state.handle)
+        self.state.current_position = self._try_with_reconnect(
+            lambda: self._sdk.get_filter_pos(self.state.handle)
+        )
         return self.state.current_position
 
     def set_position(self, position: int) -> None:
@@ -103,13 +146,20 @@ class FliDriver:
             position,
         )
 
-        self._sdk.lock_device(self.state.handle)
+        self._try_with_reconnect(lambda: self._sdk.lock_device(self.state.handle))
         try:
-            self._sdk.set_filter_pos(self.state.handle, int(position))
+            self._try_with_reconnect(
+                lambda: self._sdk.set_filter_pos(self.state.handle, int(position))
+            )
             self._wait_for_move()
-            self.state.current_position = self._sdk.get_filter_pos(self.state.handle)
+            self.state.current_position = self._try_with_reconnect(
+                lambda: self._sdk.get_filter_pos(self.state.handle)
+            )
         finally:
-            self._sdk.unlock_device(self.state.handle)
+            try:
+                self._sdk.unlock_device(self.state.handle)
+            except Exception:
+                pass
 
         self.log.info("FLI filter wheel at position %d", self.state.current_position)
 
